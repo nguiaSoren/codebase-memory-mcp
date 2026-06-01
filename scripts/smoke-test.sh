@@ -318,6 +318,21 @@ if [ "$NCLUST" -lt 1 ]; then
 fi
 echo "OK: get_architecture returned $NCLUST community cluster(s)"
 
+# 3g: search_code — basic search reports elapsed_ms + matches
+SC=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_\",\"mode\":\"compact\",\"limit\":5}")
+echo "$SC" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); assert 'elapsed_ms' in d; print('OK: search_code elapsed_ms='+str(d['elapsed_ms'])+' total_grep_matches='+str(d.get('total_grep_matches')))" 2>/dev/null || { echo "FAIL: search_code basic / no elapsed_ms"; echo "$SC" | head -c 400; exit 1; }
+
+# 3g: search_code — literal '|' under regex=false must surface a warning (#282)
+SCW=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_init|cbm_nope\",\"regex\":false,\"limit\":5}")
+echo "$SCW" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); w=' '.join(d.get('warnings',[])); assert 'regex=true' in w; print('OK: search_code literal-| warning surfaced')" 2>/dev/null || { echo "FAIL: search_code literal-| warning missing"; echo "$SCW" | head -c 400; exit 1; }
+
+# 3g: search_code — '&' in file_pattern accepted, not rejected as invalid (#272)
+SCA=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_\",\"file_pattern\":\"*R&D*.c\",\"limit\":5}")
+case "$SCA" in
+  *"invalid characters"*) echo "FAIL: search_code rejected '&' in file_pattern"; echo "$SCA" | head -c 300; exit 1 ;;
+  *) echo "OK: search_code accepts '&' in file_pattern" ;;
+esac
+
 # 3e: delete_project cleanup
 cli delete_project "{\"project\":\"$PROJECT\"}" > /dev/null
 

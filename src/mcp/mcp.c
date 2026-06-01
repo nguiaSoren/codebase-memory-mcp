@@ -3167,8 +3167,9 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
 /* Phase 4: assemble JSON output from search results */
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
                                     int raw_count, int gm_count, int limit, int mode,
-                                    int context_lines, const char *root_path) {
-    enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2 };
+                                    int context_lines, const char *root_path,
+                                    bool warn_literal_pipe, uint64_t elapsed_ms) {
+    enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -3223,10 +3224,34 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_obj_add_int(doc, root_obj, "total_grep_matches", gm_count);
     yyjson_mut_obj_add_int(doc, root_obj, "total_results", sr_count);
     yyjson_mut_obj_add_int(doc, root_obj, "raw_match_count", raw_count);
+    yyjson_mut_obj_add_int(doc, root_obj, "elapsed_ms", (int)elapsed_ms);
     if (sr_count > 0 && gm_count > 0) {
         char ratio[CBM_SZ_32];
         snprintf(ratio, sizeof(ratio), "%.1fx", (double)gm_count / (double)(sr_count + raw_count));
         yyjson_mut_obj_add_strcpy(doc, root_obj, "dedup_ratio", ratio);
+    }
+
+    /* Warnings: surface common foot-guns instead of leaving them silent. */
+    yyjson_mut_val *warnings = yyjson_mut_arr(doc);
+    if (warn_literal_pipe) {
+        yyjson_mut_arr_add_strcpy(
+            doc, warnings,
+            "pattern contains '|' but regex=false, so it is matched literally (not as "
+            "alternation). Pass regex=true for 'foo|bar' to mean 'foo OR bar'.");
+    }
+    if (elapsed_ms >= SEARCH_SLOW_MS) {
+        char slow[CBM_SZ_128];
+        snprintf(slow, sizeof(slow),
+                 "search took %dms (>%ds); narrow file_pattern/path_filter or use a more "
+                 "specific pattern",
+                 (int)elapsed_ms, SEARCH_SLOW_MS / 1000);
+        yyjson_mut_arr_add_strcpy(doc, warnings, slow);
+        char ems[CBM_SZ_32];
+        snprintf(ems, sizeof(ems), "%d", (int)elapsed_ms);
+        cbm_log_warn("search.slow", "elapsed_ms", ems); /* visibility in logs */
+    }
+    if (yyjson_mut_arr_size(warnings) > 0) {
+        yyjson_mut_obj_add_val(doc, root_obj, "warnings", warnings);
     }
 
     char *json = yy_doc_to_str(doc);
@@ -3460,11 +3485,43 @@ static int parse_search_mode(const char *mode_str) {
 }
 
 /* Validate shell-safe arguments for search. */
-static bool validate_search_args(const char *root_path, const char *file_pattern) {
-    if (!cbm_validate_shell_arg(root_path)) {
+/* Search/grep paths and globs are ALWAYS single-quoted (POSIX sh) or
+ * double-/single-quoted (Windows cmd/PowerShell) on the command line, which
+ * neutralises '&' — a very common character in real paths (R&D, "Foo & Bar",
+ * OneDrive). Accept '&' here while still rejecting every metacharacter that
+ * could break out of the quoting (#272). */
+static bool validate_search_path_arg(const char *s) {
+    if (!s) {
         return false;
     }
-    if (file_pattern && !cbm_validate_shell_arg(file_pattern)) {
+    for (const char *p = s; *p; p++) {
+        switch (*p) {
+        case '\'':
+        case '"':
+        case ';':
+        case '|':
+        case '$':
+        case '`':
+        case '<':
+        case '>':
+        case '\n':
+        case '\r':
+#ifndef _WIN32
+        case '\\':
+#endif
+            return false;
+        default:
+            break;
+        }
+    }
+    return true;
+}
+
+static bool validate_search_args(const char *root_path, const char *file_pattern) {
+    if (!validate_search_path_arg(root_path)) {
+        return false;
+    }
+    if (file_pattern && !validate_search_path_arg(file_pattern)) {
         return false;
     }
     return true;
@@ -3499,6 +3556,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
+    uint64_t search_t0 = cbm_now_ms();
+    /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —
+     * a common silent 0-match trap; flagged in the result warnings (#282). */
+    bool pat_has_pipe = pattern && strchr(pattern, '|') != NULL;
 
     int mode = parse_search_mode(mode_str);
     free(mode_str);
@@ -3708,8 +3769,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
-    char *result = assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
-                                          context_lines, root_path);
+    char *result =
+        assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
+                               root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
     free(gm);
     free(sr);
     free(raw);
@@ -3773,7 +3835,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("project not found", true);
     }
 
-    if (!cbm_validate_shell_arg(root_path)) {
+    if (!validate_search_path_arg(root_path)) {
         free(root_path);
         free(project);
         free(base_branch);
