@@ -89,6 +89,10 @@ extern void suite_matrix_new_constructs(void);
 extern void suite_grammar_probe_a(void);
 extern void suite_grammar_probe_b(void);
 extern void suite_grammar_probe_c(void);
+extern void suite_grammar_probe_d(void);
+extern void suite_grammar_probe_e(void);
+extern void suite_grammar_probe_f(void);
+extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
@@ -235,6 +239,10 @@ int main(void) {
     RUN_SUITE(grammar_probe_a);
     RUN_SUITE(grammar_probe_b);
     RUN_SUITE(grammar_probe_c);
+    RUN_SUITE(grammar_probe_d);
+    RUN_SUITE(grammar_probe_e);
+    RUN_SUITE(grammar_probe_f);
+    RUN_SUITE(grammar_probe_g);
 
     RUN_SUITE(incremental);
 
