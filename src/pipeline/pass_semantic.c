@@ -402,7 +402,13 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             }
             const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
             if (base_node && node->id != base_node->id) {
-                cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id, "INHERITS", "{}");
+                /* A base that resolves to an Interface is an IMPLEMENTS relation
+                 * (Java `implements`, C# `: IFace`, TS `implements`); a Class/
+                 * Type/Enum base is plain INHERITS. */
+                const char *base_label = cbm_registry_label_of(ctx->registry, base_qn);
+                const char *edge_type =
+                    (base_label && strcmp(base_label, "Interface") == 0) ? "IMPLEMENTS" : "INHERITS";
+                cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id, edge_type, "{}");
                 (*inherits_count)++;
             }
         }
