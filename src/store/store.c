@@ -2942,8 +2942,8 @@ static bool arch_path_prepare(const char *path, char *norm_out, size_t norm_sz, 
     strncpy(norm_out, path, norm_sz - 1);
     norm_out[norm_sz - 1] = '\0';
     size_t len = strlen(norm_out);
-    while (len > 0 && (norm_out[len - 1] == ' ' || norm_out[len - 1] == '\t' ||
-                       norm_out[len - 1] == '/')) {
+    while (len > 0 &&
+           (norm_out[len - 1] == ' ' || norm_out[len - 1] == '\t' || norm_out[len - 1] == '/')) {
         norm_out[--len] = '\0';
     }
     /* Collapse duplicate slashes */
@@ -3794,8 +3794,9 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char nsqlbuf[ST_SQL_BUF];
-    const char *nbase = "SELECT id, qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
-                        "('Function','Method','Class')";
+    const char *nbase =
+        "SELECT id, qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
+        "('Function','Method','Class')";
     if (scoped) {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", nbase, arch_path_scope_sql());
     } else {
@@ -5161,7 +5162,8 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     const char *nbase = "SELECT id, name, qualified_name, file_path FROM nodes "
                         "WHERE project=?1 AND label IN ('Function','Method','Class')";
     if (scoped) {
-        snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id LIMIT ?4", nbase, arch_path_scope_sql());
+        snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id LIMIT ?4", nbase,
+                 arch_path_scope_sql());
     } else {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id LIMIT ?2", nbase);
     }

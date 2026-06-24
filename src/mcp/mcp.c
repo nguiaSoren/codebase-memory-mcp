@@ -394,8 +394,10 @@ static const tool_def_t TOOLS[] = {
      "the real architectural seams, which often cut across the folder layout. Optional path scopes "
      "analysis to nodes under that directory prefix (file_path).",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":"
-     "\"string\",\"description\":\"Optional directory prefix to scope architecture (e.g. apps/hoa)\"},"
-     "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]}"},
+     "\"string\",\"description\":\"Optional directory prefix to scope architecture (e.g. "
+     "apps/hoa)\"},"
+     "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
+     "}"},
 
     {"search_code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
