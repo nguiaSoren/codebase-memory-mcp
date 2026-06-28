@@ -4251,6 +4251,17 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     if (ctx->enclosing_class_qn && saved_class_qn == ctx->enclosing_class_qn &&
         !strchr(func_qn, '.')) {
         func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn, func_qn);
+    } else if (ctx->enclosing_class_qn && saved_class_qn != ctx->enclosing_class_qn &&
+               strchr(func_qn, '.')) {
+        /* Out-of-line method `Class::method`: c_build_qn yields the bare
+         * "Class.method" (no module) — the class scope was resolved HERE to the
+         * full module-qualified class QN (saved_class_qn != enclosing_class_qn).
+         * Rebuild as <class QN>.<method short name> so the caller_qn matches the
+         * def walk and call-scope QN, which qualify out-of-line methods the same
+         * way. Without this the caller_qn stays "Class.method", the exact-equality
+         * lsp_resolve join misses, and the LSP rescue is discarded (gap #5a). */
+        const char *dot = strrchr(func_qn, '.');
+        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn, dot + 1);
     } else if (!strchr(func_qn, '.')) {
         /* A free function in a namespace is qualified by the namespace scope
          * (current_namespace is module_qn.ns), matching the def QN the extractor
