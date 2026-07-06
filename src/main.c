@@ -479,6 +479,16 @@ static int run_cli(int argc, char **argv) {
         } else {
             exit_code = cli_print_mcp_result(result);
         }
+        if (cbm_index_worker_active()) {
+            /* Supervised worker: the response is delivered (file + stdout).
+             * Skip the multi-GB teardown (server/store frees) — the process
+             * dies now and the OS reclaims everything wholesale; piecemeal
+             * free() of a kernel-scale graph costs minutes. _Exit skips
+             * atexit/LSan by design for this prod worker path. */
+            cbm_log_info("index.worker.fast_exit", "action", "_Exit");
+            fflush(NULL);
+            _Exit(exit_code);
+        }
         free(result);
     }
 

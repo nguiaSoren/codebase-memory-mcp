@@ -614,4 +614,11 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
 bool extract_grpc_service_method(const char *callee, char *service, size_t srv_sz, char *method,
                                  size_t meth_sz);
 
+/* Extraction back-pressure observability (pass_parallel.c): nap-cycle counter
+ * for the over-budget collect+nap gate. Test hook — asserts the gate stops
+ * re-paying the nap tax once a full cycle failed to reclaim under budget
+ * (futile: the resident floor, not transients, holds the memory). */
+long cbm_pp_bp_nap_cycles(void);
+void cbm_pp_bp_nap_cycles_reset(void);
+
 #endif /* CBM_PIPELINE_INTERNAL_H */

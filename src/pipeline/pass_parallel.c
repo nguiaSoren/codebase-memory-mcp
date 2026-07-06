@@ -98,6 +98,20 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include <string.h>
 #include <time.h>
 
+/* Back-pressure nap-cycle counter (test observability): each execution of the
+ * over-budget collect+nap gate counts one cycle. Lets tests assert the gate does
+ * not re-pay the full nap tax on every file pull when napping cannot reclaim
+ * memory (the resident floor, not in-flight transients, holds the budget). */
+static _Atomic long g_bp_nap_cycles = 0;
+
+long cbm_pp_bp_nap_cycles(void) {
+    return atomic_load_explicit(&g_bp_nap_cycles, memory_order_relaxed);
+}
+
+void cbm_pp_bp_nap_cycles_reset(void) {
+    atomic_store_explicit(&g_bp_nap_cycles, 0, memory_order_relaxed);
+}
+
 /* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.
  * Follows the limits.c strtol convention: unset / unparseable / non-positive
  * → return 0 so the caller keeps its derived default. */
@@ -687,6 +701,13 @@ typedef struct {
      * path lock). Merged into the pipeline in the sequential merge loop. */
     pp_err_list_t *err_lists;
     _Atomic int oversized_warned; /* throttle for the index.file_oversized WARN */
+
+    /* Back-pressure futility latch: set when a full collect+nap cycle ended
+     * still over budget — the resident floor (graph + retained sources), not
+     * in-flight transients, holds the memory, so napping cannot reclaim it.
+     * While set, pulls skip the nap (the designed soft overshoot); the cheap
+     * over-budget probe re-arms the gate once RSS drains under budget. */
+    _Atomic int bp_futile;
 } extract_ctx_t;
 
 /* Cap on the number of index.file_oversized WARN lines (the full list still goes
@@ -763,14 +784,37 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * near the budget instead of letting all workers parse their biggest
          * files at once. Self-disabling when the budget is unset (tests) or RSS
          * is under budget; bounded spins avoid deadlock when the resident graph
-         * is itself near budget (then proceed with a soft overshoot). */
-        if (cbm_mem_budget() > 0 && cbm_mem_over_budget()) {
-            cbm_mem_collect();
-            for (int bp = 0; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
-                             !atomic_load_explicit(ec->cancelled, memory_order_relaxed);
-                 bp++) {
-                struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
-                cbm_nanosleep(&nap, NULL);
+         * is itself near budget (then proceed with a soft overshoot).
+         *
+         * Futility latch: when a FULL nap cycle ends still over budget, the
+         * resident floor — not transients — holds the memory; napping again on
+         * the next pull cannot reclaim it and only idles workers (linux kernel:
+         * one full cycle per pull ≈ 390 s at 79% avg CPU). Latch bp_futile and
+         * proceed with the soft overshoot; the over-budget probe below re-arms
+         * the gate as soon as RSS drains under budget. */
+        if (cbm_mem_budget() > 0) {
+            bool over = cbm_mem_over_budget();
+            bool futile = atomic_load_explicit(&ec->bp_futile, memory_order_relaxed) != 0;
+            if (over && !futile) {
+                cbm_mem_collect();
+                atomic_fetch_add_explicit(&g_bp_nap_cycles, SKIP_ONE, memory_order_relaxed);
+                int bp = 0;
+                for (; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
+                       !atomic_load_explicit(ec->cancelled, memory_order_relaxed);
+                     bp++) {
+                    struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
+                    cbm_nanosleep(&nap, NULL);
+                }
+                if (bp == PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget()) {
+                    /* Log only the 0→1 transition: all workers race into the
+                     * gate before anyone latches, so a plain store would WARN
+                     * once per worker (12 lines per latch event). */
+                    if (atomic_exchange_explicit(&ec->bp_futile, 1, memory_order_relaxed) == 0) {
+                        cbm_log_warn("mem.backpressure.futile", "action", "soft_overshoot");
+                    }
+                }
+            } else if (!over && futile) {
+                atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
             }
         }
 
@@ -1075,6 +1119,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     atomic_init(&ec.retained_bytes, 0);
     atomic_init(&ec.retain_cap_warned, 0);
     atomic_init(&ec.oversized_warned, 0);
+    atomic_init(&ec.bp_futile, 0);
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);

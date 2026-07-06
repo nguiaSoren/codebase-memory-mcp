@@ -3866,8 +3866,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    /* Free the pipeline only after the response doc copied the excluded list. */
-    cbm_pipeline_free(p);
+    /* Free the pipeline only after the response doc copied the excluded list.
+     * Supervised worker: skip the deep free — the process exits right after
+     * handing over the response (main.c fast-exits), and piecemeal-freeing a
+     * multi-GB graph before process death costs minutes on kernel-scale repos;
+     * the OS reclaims it wholesale at exit. In-process paths (tests, kill
+     * switch, degrade) still free normally. */
+    if (cbm_index_worker_active()) {
+        cbm_log_info("index.worker.fast_exit", "skip", "pipeline_free");
+    } else {
+        cbm_pipeline_free(p);
+    }
     free(project_name);
     free(repo_path);
 

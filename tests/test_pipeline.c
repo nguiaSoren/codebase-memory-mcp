@@ -8,6 +8,7 @@
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
@@ -6541,6 +6542,79 @@ TEST(pipeline_committed_counts_match_persisted) {
     PASS();
 }
 
+/* Reproduce-first (perf, linux-kernel finding): the extraction back-pressure
+ * gate must stop re-paying the full collect+nap tax on every file pull once a
+ * full nap cycle has failed to reclaim under budget. With CBM_MEM_BUDGET_MB=1
+ * the test process RSS is permanently over budget and NOTHING napping can
+ * change that (the resident floor IS the process) — napping is provably futile.
+ * OLD behavior: one full 40-spin nap cycle per pulled file (kernel index: ~63k
+ * pulls × ~120 ms ÷ 12 workers ≈ 390 s of idle workers at 79% avg CPU).
+ * FIXED: the first futile cycle flips a shared flag; later pulls proceed with
+ * the designed soft overshoot. Cycle count then can't exceed one cycle per
+ * worker (workers already inside the gate when the flag flips) plus re-probes.
+ * RED on the unfixed gate: cycles == file count (64) > cores+2.
+ * The counter (cbm_pp_bp_nap_cycles) makes this deterministic — no timing.
+ *
+ * The gate lives ONLY in the parallel extract path, so the fixture MUST exceed
+ * MIN_FILES_FOR_PARALLEL (50) — else the run routes sequential, the gate never
+ * fires, and the test would pass vacuously (cycles==0). The engagement assert
+ * below (cycles >= 1) is a hard guard against that regressing silently. */
+TEST(pipeline_backpressure_futile_nap_disengages) {
+    /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
+     * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
+    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
+    if (!cbm_mkdtemp(g_tmpdir)) {
+        FAIL("failed to create temp dir");
+    }
+    for (int i = 0; i < 64; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/f%02d.go", g_tmpdir, i);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            FAIL("failed to create fixture file");
+        }
+        fprintf(f, "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n", i, i);
+        fclose(f);
+    }
+
+    /* 1 MB budget: over-budget on every pull, unreclaimable by napping. */
+    cbm_setenv("CBM_MEM_BUDGET_MB", "1", 1);
+    cbm_mem_init(0);
+    ASSERT_TRUE(cbm_mem_budget() > 0);
+    ASSERT_TRUE(cbm_mem_over_budget());
+
+    cbm_pp_bp_nap_cycles_reset();
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    long cycles = cbm_pp_bp_nap_cycles();
+
+    /* Restore the tests' default budget-off state BEFORE asserting. */
+    cbm_unsetenv("CBM_MEM_BUDGET_MB");
+    cbm_mem_init(0);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+
+    ASSERT_EQ(rc, 0);
+    /* Engagement guard (anti-vacuous): the gate must have actually run — the
+     * parallel path taken and the 1 MB budget exceeded on every pull. cycles==0
+     * means the fixture routed sequential (or the gate was compiled out) and
+     * this test proved NOTHING; fail loudly rather than pass vacuously. */
+    if (cycles < 1) {
+        FAIL("back-pressure gate never engaged (cycles==0) — fixture routed sequential?");
+    }
+    /* Futile napping must disengage: at most one in-flight cycle per worker
+     * plus a small margin, never one per file (64). */
+    long bound = (long)cbm_system_info().total_cores + 2;
+    if (cycles > bound) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "nap cycles %ld > bound %ld (gate re-paid per pull)", cycles,
+                 bound);
+        FAIL(msg);
+    }
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -6554,6 +6628,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    /* Extraction back-pressure */
+    RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
