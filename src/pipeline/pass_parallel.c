@@ -687,22 +687,7 @@ typedef struct {
     CBMFileResult **result_cache;
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
-    _Atomic int next_file_idx; /* legacy single-cursor (unused when claimed != NULL) */
-
-    /* Dual-ended work queue (peak-RSS control): sorted[] is size-DESCENDING;
-     * a small band of workers (big_workers = f(worker count)) claims from the
-     * BIG end while the rest claim from the SMALL end. The number of giant
-     * parse working-sets in flight is structurally bounded by big_workers —
-     * the old single biggest-first cursor put the 12 largest files of the
-     * kernel into 12 workers at once (global RSS peak 24.4 GB at t=47s, a
-     * ~14 GB transient above the retained floor). Giants still start at t=0
-     * (LPT makespan preserved). Per-file claim flags make the crossover
-     * race-free; hints are advisory scan starts. Output is schedule-
-     * independent (content-canonical since the determinism fix). */
-    _Atomic unsigned char *claimed;
-    _Atomic int big_hint;
-    _Atomic int small_hint;
-    int big_workers;
+    _Atomic int next_file_idx;
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
 
@@ -724,28 +709,6 @@ typedef struct {
      * over-budget probe re-arms the gate once RSS drains under budget. */
     _Atomic int bp_futile;
 } extract_ctx_t;
-
-/* Claim the next unclaimed file from one end of the dual-ended queue.
- * Returns the sorted[] index, or -1 when the queue is exhausted. */
-static int pp_claim_next(extract_ctx_t *ec, bool from_big) {
-    if (from_big) {
-        for (int i = atomic_load_explicit(&ec->big_hint, memory_order_relaxed);
-             i < ec->file_count; i++) {
-            if (!atomic_exchange_explicit(&ec->claimed[i], 1, memory_order_relaxed)) {
-                atomic_store_explicit(&ec->big_hint, i + 1, memory_order_relaxed);
-                return i;
-            }
-        }
-    } else {
-        for (int i = atomic_load_explicit(&ec->small_hint, memory_order_relaxed); i >= 0; i--) {
-            if (!atomic_exchange_explicit(&ec->claimed[i], 1, memory_order_relaxed)) {
-                atomic_store_explicit(&ec->small_hint, i - 1, memory_order_relaxed);
-                return i;
-            }
-        }
-    }
-    return -1;
-}
 
 /* Cap on the number of index.file_oversized WARN lines (the full list still goes
  * to the response/logfile — this only throttles the stderr noise). */
@@ -803,22 +766,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         ws->local_gbuf = cbm_gbuf_new_shared_ids(ec->project_name, ec->repo_path, ec->shared_ids);
     }
 
-    /* Pull files: dual-ended claim queue (see extract_ctx_t), with the
-     * legacy single cursor as fallback when claim flags are unavailable. */
-    bool from_big = worker_id < ec->big_workers;
+    /* Pull files from shared atomic counter */
     while (SKIP_ONE) {
-        int sort_pos;
-        if (ec->claimed) {
-            sort_pos = pp_claim_next(ec, from_big);
-            if (sort_pos < 0) {
-                break;
-            }
-        } else {
-            sort_pos = atomic_fetch_add_explicit(&ec->next_file_idx, SKIP_ONE,
-                                                 memory_order_relaxed);
-            if (sort_pos >= ec->file_count) {
-                break;
-            }
+        int sort_pos =
+            atomic_fetch_add_explicit(&ec->next_file_idx, SKIP_ONE, memory_order_relaxed);
+        if (sort_pos >= ec->file_count) {
+            break;
         }
         if (atomic_load_explicit(ec->cancelled, memory_order_relaxed)) {
             break;
@@ -1163,16 +1116,6 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
-    ec.claimed = calloc((size_t)file_count, sizeof(_Atomic unsigned char));
-    atomic_init(&ec.big_hint, 0);
-    atomic_init(&ec.small_hint, file_count - 1);
-    ec.big_workers = worker_count / 6;
-    if (ec.big_workers < 1) {
-        ec.big_workers = 1;
-    }
-    if (ec.big_workers > 3) {
-        ec.big_workers = 3;
-    }
     atomic_init(&ec.retained_bytes, 0);
     atomic_init(&ec.retain_cap_warned, 0);
     atomic_init(&ec.oversized_warned, 0);
@@ -1183,8 +1126,6 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
-    free((void *)ec.claimed);
-    ec.claimed = NULL;
 
     /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
     CBM_PROF_START(t_merge);
