@@ -42,6 +42,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -389,6 +390,35 @@ void cbm_ui_log_append(const char *line) {
     cbm_mutex_unlock(&g_log_mutex);
 }
 
+/* Append a printf-formatted fragment at *pos within a bufsz buffer, never
+ * advancing *pos past bufsz. snprintf returns the length it WOULD have written,
+ * so `pos += snprintf(...)` runs pos past the end on truncation and the next
+ * call computes a wrapped (huge) remaining size and writes out of bounds. This
+ * clamps: on truncation *pos is pinned at bufsz and further appends are no-ops. */
+static void http_appendf(char *buf, size_t bufsz, int *pos, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void http_appendf(char *buf, size_t bufsz, int *pos, const char *fmt, ...) {
+    if (*pos < 0) {
+        return;
+    }
+    if ((size_t)*pos >= bufsz) {
+        *pos = (int)bufsz;
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, bufsz - (size_t)*pos, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return;
+    }
+    if ((size_t)n >= bufsz - (size_t)*pos) {
+        *pos = (int)bufsz;
+    } else {
+        *pos += n;
+    }
+}
+
 /* GET /api/logs?lines=N — returns last N log lines */
 static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char lines_str[16] = {0};
@@ -414,7 +444,7 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     int pos = 0;
-    pos += snprintf(buf + pos, buf_size - (size_t)pos, "{\"lines\":[");
+    http_appendf(buf, buf_size, &pos, "{\"lines\":[");
     for (int i = 0; i < count; i++) {
         int idx = (start + i) % LOG_RING_SIZE;
         if (i > 0)
@@ -439,7 +469,7 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         buf[pos++] = '"';
     }
     cbm_mutex_unlock(&g_log_mutex);
-    pos += snprintf(buf + pos, buf_size - (size_t)pos, "],\"total\":%d}", total);
+    http_appendf(buf, buf_size, &pos, "],\"total\":%d}", total);
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
     free(buf);
@@ -474,10 +504,10 @@ static void handle_processes(cbm_http_conn_t *c) {
         user_s = (double)u.QuadPart / 1e7;
         sys_s = (double)k.QuadPart / 1e7;
     }
-    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-                    "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                    "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[]}",
-                    (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s);
+    http_appendf(buf, sizeof(buf), &pos,
+                 "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
+                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[]}",
+                 (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s);
 #else
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -485,12 +515,12 @@ static void handle_processes(cbm_http_conn_t *c) {
 #ifdef __APPLE__
     rss_kb /= 1024;
 #endif
-    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-                    "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                    "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
-                    (int)getpid(), (double)rss_kb / 1024.0,
-                    (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6,
-                    (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6);
+    http_appendf(buf, sizeof(buf), &pos,
+                 "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
+                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
+                 (int)getpid(), (double)rss_kb / 1024.0,
+                 (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6,
+                 (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6);
 
     FILE *fp = popen("LC_ALL=C ps -eo pid,pcpu,rss,etime,comm 2>/dev/null"
                      " | grep '[c]odebase-memory-mcp'",
@@ -508,11 +538,11 @@ static void handle_processes(cbm_http_conn_t *c) {
             if (sscanf(line, "%d %f %ld %63s %255s", &pid, &cpu, &rss, elapsed, comm) >= 4) {
                 if (proc_count > 0)
                     buf[pos++] = ',';
-                pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-                                "{\"pid\":%d,\"cpu\":%.1f,\"rss_mb\":%.1f,"
-                                "\"elapsed\":\"%s\",\"command\":\"%s\",\"is_self\":%s}",
-                                pid, (double)cpu, (double)rss / 1024.0, elapsed, comm,
-                                pid == (int)getpid() ? "true" : "false");
+                http_appendf(buf, sizeof(buf), &pos,
+                             "{\"pid\":%d,\"cpu\":%.1f,\"rss_mb\":%.1f,"
+                             "\"elapsed\":\"%s\",\"command\":\"%s\",\"is_self\":%s}",
+                             pid, (double)cpu, (double)rss / 1024.0, elapsed, comm,
+                             pid == (int)getpid() ? "true" : "false");
                 if (pos >= (int)sizeof(buf)) {
                     pos = (int)sizeof(buf) - 1;
                 }
@@ -521,7 +551,7 @@ static void handle_processes(cbm_http_conn_t *c) {
         }
         pclose(fp);
     }
-    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "]}");
+    http_appendf(buf, sizeof(buf), &pos, "]}");
 #endif
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
@@ -602,7 +632,7 @@ static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 #include <dirent.h>
 
 static void append_roots_json(char *buf, size_t bufsz, int *pos) {
-    *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, ",\"roots\":[");
+    http_appendf(buf, bufsz, pos, ",\"roots\":[");
 #ifdef _WIN32
     DWORD drives = GetLogicalDrives();
     int count = 0;
@@ -613,12 +643,12 @@ static void append_roots_json(char *buf, size_t bufsz, int *pos) {
         if (count++ > 0) {
             buf[(*pos)++] = ',';
         }
-        *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, "\"%c:/\"", 'A' + i);
+        http_appendf(buf, bufsz, pos, "\"%c:/\"", 'A' + i);
     }
 #else
-    *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, "\"/\"");
+    http_appendf(buf, bufsz, pos, "\"/\"");
 #endif
-    *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, "]");
+    http_appendf(buf, bufsz, pos, "]");
 }
 
 /* GET /api/browse?path=/some/dir — list subdirectories for file picker */
@@ -653,7 +683,7 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     /* Build JSON response */
     char buf[32768];
     int pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "{\"path\":\"%s\",\"dirs\":[", path);
+    http_appendf(buf, sizeof(buf), &pos, "{\"path\":\"%s\",\"dirs\":[", path);
 
     struct dirent *ent;
     int count = 0;
@@ -674,7 +704,7 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         {
             char esc[512];
             cbm_json_escape(esc, (int)sizeof(esc), ent->d_name);
-            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\"%s\"", esc);
+            http_appendf(buf, sizeof(buf), &pos, "\"%s\"", esc);
         }
         if (pos >= (int)sizeof(buf)) {
             pos = (int)sizeof(buf) - 1;
@@ -706,9 +736,9 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     {
         char esc_parent[2048];
         cbm_json_escape(esc_parent, (int)sizeof(esc_parent), parent);
-        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "],\"parent\":\"%s\"", esc_parent);
+        http_appendf(buf, sizeof(buf), &pos, "],\"parent\":\"%s\"", esc_parent);
         append_roots_json(buf, sizeof(buf), &pos);
-        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "}");
+        http_appendf(buf, sizeof(buf), &pos, "}");
     }
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -760,8 +790,8 @@ static void handle_adr_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                     buf[pos++] = ch;
                 }
             }
-            pos += snprintf(buf + pos, buf_size - (size_t)pos, "\",\"updated_at\":\"%s\"}",
-                            adr.updated_at ? adr.updated_at : "");
+            http_appendf(buf, buf_size, &pos, "\",\"updated_at\":\"%s\"}",
+                         adr.updated_at ? adr.updated_at : "");
             cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
             free(buf);
         } else {
@@ -1178,9 +1208,9 @@ static void handle_index_status(cbm_http_conn_t *c) {
         if (pos > 1)
             buf[pos++] = ',';
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
-        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-                        "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
-                        g_index_jobs[i].root_path, st == 3 ? g_index_jobs[i].error_msg : "");
+        http_appendf(buf, sizeof(buf), &pos,
+                     "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
+                     g_index_jobs[i].root_path, st == 3 ? g_index_jobs[i].error_msg : "");
     }
     buf[pos++] = ']';
     buf[pos] = '\0';

@@ -44,6 +44,7 @@ typedef SOCKET th_sock_t;
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h> /* struct timeval for the SO_RCVTIMEO watchdog (#798 follow-up) */
+#include <sys/wait.h> /* fork/waitpid crash-isolation for the browse overflow guard */
 #include <unistd.h>
 typedef int th_sock_t;
 #define th_sock_close close
@@ -1110,9 +1111,67 @@ TEST(ui_server_rejects_non_loopback_host) {
     PASS();
 }
 
+/* The directory browser formats readdir() entries into a fixed 32 KB response
+ * buffer. The per-entry loop is clamped, but the trailing "parent"/"roots"
+ * appends were not — once the entries filled the buffer, pos ran past the end
+ * and the next size argument wrapped, writing out of bounds. Fill the buffer
+ * with many long-named subdirectories and browse it in a forked child so an
+ * overflow surfaces as a killing signal (ASan abort) rather than a clean run. */
+TEST(ui_server_browse_wide_dir_no_overflow) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
+#else
+    char *dir = th_mktempdir("cbm_browse");
+    if (!dir) {
+        FAIL("mktempdir");
+    }
+    char longname[240];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    for (int i = 0; i < 250; i++) { /* 250 * ~220 chars overflows the 32 KB buffer */
+        char sub[600];
+        snprintf(sub, sizeof(sub), "%s/%s%03d", dir, longname, i);
+        th_mkdir_p(sub);
+    }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        th_server_t ts;
+        if (th_server_start(&ts) != 0) {
+            _exit(2);
+        }
+        char req[512];
+        snprintf(req, sizeof(req), "GET /api/browse?path=%s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                 dir);
+        char *resp = malloc(262144);
+        int n = resp ? th_http(cbm_http_server_port(ts.srv), req, resp, 262144) : 0;
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        free(resp);
+        th_server_stop(&ts);
+        _exit(ok ? 0 : 3);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    char rm[600];
+    snprintf(rm, sizeof(rm), "rm -rf '%s'", dir);
+    (void)system(rm);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "browse killed by signal %d — response buffer overflow",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(httpd) {
+    RUN_TEST(ui_server_browse_wide_dir_no_overflow);
     /* Parser / helpers */
     RUN_TEST(httpd_parse_simple_get);
     RUN_TEST(httpd_parse_post_with_body_offset);
