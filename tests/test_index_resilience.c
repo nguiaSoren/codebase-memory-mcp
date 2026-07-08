@@ -248,8 +248,148 @@ TEST(index_clean_run_no_logfile) {
     ASSERT_NULL(yyjson_obj_get(sc, "skipped"));
     ASSERT_NULL(yyjson_obj_get(sc, "logfile"));
 
+    /* Clean parses → no parse-coverage flags either (#963). */
+    int pp_count = yyjson_get_int(yyjson_obj_get(sc, "parse_partial_count"));
+    ASSERT_EQ(pp_count, 0);
+    ASSERT_NULL(yyjson_obj_get(sc, "parse_partial"));
+
     int funcs = rh_count_label(store, lp.project, "Function");
     ASSERT_GTE(funcs, 2);
+
+    yyjson_doc_free(d);
+    free(resp);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
+/* INV(parse-partial-reported, #963): a file whose parse tree contains
+ * ERROR/MISSING regions (here: the preprocessor-blind #ifdef-split-brace C
+ * pattern) is INDEXED — not skipped — and the best-effort coverage signal
+ * surfaces on every layer:
+ *   - skipped_count == 0 (a partial parse is NOT a skip),
+ *   - parse_partial_count >= 1 with the file + its line ranges + the
+ *     best-effort note in parse_partial{},
+ *   - the per-run logfile lists it under phase "parse_partial",
+ *   - the File node carries {"parse_incomplete":true,"error_ranges":...},
+ *   - clean neighbors still extract.
+ *
+ * Guard property: on the unwired code there is no parse_partial_count /
+ * parse_partial[] / File-node marker — the file silently looks fully indexed.
+ */
+TEST(index_parse_partial_reported) {
+    RProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_resil_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    rh_to_fwd_slashes(lp.tmpdir);
+
+    /* Both #ifdef branches open `guarded(...) {` sharing ONE close brace —
+     * brace-unbalanced for a preprocessor-blind parse → ERROR region. */
+    ri_write_text(lp.tmpdir, "split.c",
+                  "void ok_before(void) { }\n"
+                  "#ifdef FEATURE_A\n"
+                  "static int guarded(int x) {\n"
+                  "#else\n"
+                  "static int guarded_alt(int x) {\n"
+                  "#endif\n"
+                  "    return x + 1;\n"
+                  "}\n");
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 1\n");
+
+    char logpath[700];
+    snprintf(logpath, sizeof(logpath), "%s/coverage.log", lp.tmpdir);
+    cbm_setenv("CBM_INDEX_LOG", logpath, 1);
+
+    char *resp = NULL;
+    cbm_store_t *store = ri_index_capture(&lp, &resp);
+    cbm_unsetenv("CBM_INDEX_LOG");
+
+    if (!resp) {
+        FAIL("no MCP response");
+    }
+    if (!store) {
+        free(resp);
+        FAIL("store did not open");
+    }
+
+    yyjson_doc *d = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(d);
+    yyjson_val *sc = yyjson_obj_get(yyjson_doc_get_root(d), "structuredContent");
+    ASSERT_NOT_NULL(sc);
+
+    /* Indexed, and NOT counted as a skip. */
+    const char *status = yyjson_get_str(yyjson_obj_get(sc, "status"));
+    ASSERT_NOT_NULL(status);
+    ASSERT_STR_EQ("indexed", status);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(sc, "skipped_count")), 0);
+
+    /* The coverage signal is surfaced with ranges + the best-effort note. */
+    ASSERT_GTE(yyjson_get_int(yyjson_obj_get(sc, "parse_partial_count")), 1);
+    yyjson_val *pp = yyjson_obj_get(sc, "parse_partial");
+    ASSERT_NOT_NULL(pp);
+    yyjson_val *files = yyjson_obj_get(pp, "files");
+    ASSERT_NOT_NULL(files);
+    int found_split = 0;
+    size_t idx = 0;
+    size_t fmax = 0;
+    yyjson_val *fe = NULL;
+    yyjson_arr_foreach(files, idx, fmax, fe) {
+        const char *fp = yyjson_get_str(yyjson_obj_get(fe, "path"));
+        const char *ranges = yyjson_get_str(yyjson_obj_get(fe, "error_ranges"));
+        if (fp && strstr(fp, "split.c")) {
+            found_split = 1;
+            ASSERT_NOT_NULL(ranges);
+            ASSERT_GT((int)strlen(ranges), 0);
+        }
+    }
+    ASSERT_TRUE(found_split);
+    const char *note = yyjson_get_str(yyjson_obj_get(pp, "note"));
+    ASSERT_NOT_NULL(note);
+    ASSERT_NOT_NULL(strstr(note, "guarantee"));
+
+    /* Logfile lists it under the distinct phase. */
+    const char *logfile = yyjson_get_str(yyjson_obj_get(sc, "logfile"));
+    ASSERT_NOT_NULL(logfile);
+    char *logtext = ri_slurp(logfile);
+    ASSERT_NOT_NULL(logtext);
+    ASSERT_NOT_NULL(strstr(logtext, "parse_partial"));
+    ASSERT_NOT_NULL(strstr(logtext, "split.c"));
+    free(logtext);
+
+    /* The File node carries the queryable marker. */
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_qn_suffix(store, lp.project, "__file__", &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    int marked = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].file_path && strstr(nodes[i].file_path, "split.c")) {
+            ASSERT_NOT_NULL(nodes[i].properties_json);
+            ASSERT_NOT_NULL(strstr(nodes[i].properties_json, "\"parse_incomplete\":true"));
+            ASSERT_NOT_NULL(strstr(nodes[i].properties_json, "\"error_ranges\":\""));
+            marked = 1;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    ASSERT_TRUE(marked);
+
+    /* The marker is queryable exactly as the index_repository tool description
+     * advertises (agents are pointed at this query to find unindexed code). */
+    char qargs[900];
+    snprintf(qargs, sizeof(qargs),
+             "{\"project\":\"%s\",\"query\":\"MATCH (f:File) WHERE f.parse_incomplete = true "
+             "RETURN f.file_path, f.error_ranges\"}",
+             lp.project);
+    char *qresp = cbm_mcp_handle_tool(lp.srv, "query_graph", qargs);
+    ASSERT_NOT_NULL(qresp);
+    ASSERT_NOT_NULL(strstr(qresp, "split.c"));
+    free(qresp);
+
+    /* Clean neighbors still extract. */
+    int funcs = rh_count_label(store, lp.project, "Function");
+    ASSERT_GTE(funcs, 1);
 
     yyjson_doc_free(d);
     free(resp);
@@ -260,4 +400,5 @@ TEST(index_clean_run_no_logfile) {
 SUITE(index_resilience) {
     RUN_TEST(index_oversized_file_reported);
     RUN_TEST(index_clean_run_no_logfile);
+    RUN_TEST(index_parse_partial_reported);
 }

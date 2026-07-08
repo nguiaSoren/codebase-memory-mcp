@@ -316,7 +316,14 @@ static const tool_def_t TOOLS[] = {
      "Index a repository into the knowledge graph. "
      "Special mode 'cross-repo-intelligence': skip extraction, only match Routes/Channels "
      "across projects to create CROSS_HTTP_CALLS/CROSS_ASYNC_CALLS/CROSS_CHANNEL edges. "
-     "Requires target_projects param. Ensure target projects have fresh indexes first.",
+     "Requires target_projects param. Ensure target projects have fresh indexes first. "
+     "COVERAGE: the response reports files that were NOT fully indexed — 'skipped' (not "
+     "indexed at all: oversized/read/parse failures) and 'parse_partial' (indexed, but "
+     "constructs inside the listed line ranges could not be parsed and are absent from the "
+     "graph). parse_partial files also carry {parse_incomplete:true, error_ranges} on their "
+     "File node — query later via query_graph: MATCH (f:File) WHERE f.parse_incomplete = true "
+     "RETURN f. Both signals are best-effort: absence of a flag is NOT a completeness "
+     "guarantee; prefer grep inside flagged ranges.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
      "\"mode\":{\"type\":\"string\","
@@ -3299,36 +3306,100 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
  * the JSON carries "count" + "truncated" so nothing is silently hidden. */
 enum { INDEX_SKIPPED_FILE_CAP = 50 };
 
+/* True when a recorded per-file entry is the parse-partial coverage signal
+ * (#963) rather than a genuine skip. Kept out of skipped[]/skipped_count so
+ * the "skipped" contract (file NOT indexed) stays exact. */
+static bool is_parse_partial(const cbm_file_error_t *e) {
+    return e->phase && strcmp(e->phase, "parse_partial") == 0;
+}
+
 /* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
  * top-level "skipped_count" (0 on clean runs) so consumers can rely on it.
  * When there are skips, also emits:
  *   "skipped": {"files":[{path,reason,phase}..(<=50)], "count":N, "truncated":bool}
  * and, if a per-run logfile was written, "logfile": "<path>".
  * The run status stays "indexed" — a skipped file is the expected handled
- * outcome, not a failure. errs[] is borrowed (copied into doc). */
+ * outcome, not a failure. errs[] is borrowed (copied into doc) and may contain
+ * parse_partial entries, which are filtered out here (reported separately by
+ * add_parse_partial_summary). */
 static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_file_error_t *errs, int count, const char *logfile) {
-    yyjson_mut_obj_add_int(doc, root, "skipped_count", count < 0 ? 0 : count);
-    if (!errs || count <= 0) {
+    int skips = 0;
+    for (int i = 0; i < count; i++) {
+        if (!is_parse_partial(&errs[i])) {
+            skips++;
+        }
+    }
+    yyjson_mut_obj_add_int(doc, root, "skipped_count", skips);
+    if (logfile && logfile[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
+    }
+    if (!errs || skips <= 0) {
         return;
     }
     yyjson_mut_val *skipped = yyjson_mut_obj(doc);
     yyjson_mut_val *files = yyjson_mut_arr(doc);
-    int shown = count < INDEX_SKIPPED_FILE_CAP ? count : INDEX_SKIPPED_FILE_CAP;
-    for (int i = 0; i < shown; i++) {
+    int shown = 0;
+    for (int i = 0; i < count && shown < INDEX_SKIPPED_FILE_CAP; i++) {
+        if (is_parse_partial(&errs[i])) {
+            continue;
+        }
         yyjson_mut_val *fe = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "reason", errs[i].reason ? errs[i].reason : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "phase", errs[i].phase ? errs[i].phase : "");
         yyjson_mut_arr_add_val(files, fe);
+        shown++;
     }
     yyjson_mut_obj_add_val(doc, skipped, "files", files);
-    yyjson_mut_obj_add_int(doc, skipped, "count", count);
-    yyjson_mut_obj_add_bool(doc, skipped, "truncated", count > INDEX_SKIPPED_FILE_CAP);
+    yyjson_mut_obj_add_int(doc, skipped, "count", skips);
+    yyjson_mut_obj_add_bool(doc, skipped, "truncated", skips > INDEX_SKIPPED_FILE_CAP);
     yyjson_mut_obj_add_val(doc, root, "skipped", skipped);
-    if (logfile && logfile[0]) {
-        yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
+}
+
+/* Attach the best-effort parse-coverage summary (#963). Always emits a
+ * top-level "parse_partial_count" (0 on clean runs). When files were flagged:
+ *   "parse_partial": {"files":[{path,error_ranges}..(<=50)], "count":N,
+ *                     "truncated":bool, "note":"..."}
+ * These files WERE indexed — constructs inside the listed 1-based line ranges
+ * are missing from the graph because tree-sitter could not parse them. The
+ * note spells out the best-effort framing: absence from this list is NOT a
+ * completeness guarantee. */
+static void add_parse_partial_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                      const cbm_file_error_t *errs, int count) {
+    int partials = 0;
+    for (int i = 0; i < count; i++) {
+        if (is_parse_partial(&errs[i])) {
+            partials++;
+        }
     }
+    yyjson_mut_obj_add_int(doc, root, "parse_partial_count", partials);
+    if (!errs || partials <= 0) {
+        return;
+    }
+    yyjson_mut_val *pp = yyjson_mut_obj(doc);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int shown = 0;
+    for (int i = 0; i < count && shown < INDEX_SKIPPED_FILE_CAP; i++) {
+        if (!is_parse_partial(&errs[i])) {
+            continue;
+        }
+        yyjson_mut_val *fe = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "error_ranges", errs[i].reason ? errs[i].reason : "");
+        yyjson_mut_arr_add_val(files, fe);
+        shown++;
+    }
+    yyjson_mut_obj_add_val(doc, pp, "files", files);
+    yyjson_mut_obj_add_int(doc, pp, "count", partials);
+    yyjson_mut_obj_add_bool(doc, pp, "truncated", partials > INDEX_SKIPPED_FILE_CAP);
+    yyjson_mut_obj_add_str(doc, pp, "note",
+                           "Best-effort signal, not a completeness guarantee: these files WERE "
+                           "indexed, but constructs inside the listed line ranges (1-based) could "
+                           "not be parsed and are missing from the graph. Prefer text search "
+                           "(grep) for those regions. Files absent from this list are NOT "
+                           "guaranteed to be fully indexed.");
+    yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
 }
 
 /* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
@@ -3360,8 +3431,15 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
         cbm_log_warn("index.logfile_open_fail", "path", path);
         return false;
     }
-    (void)fprintf(f, "# codebase-memory-mcp index skip report\n");
-    (void)fprintf(f, "# project=%s skipped=%d\n", project ? project : "", count);
+    int partials = 0;
+    for (int i = 0; i < count; i++) {
+        if (is_parse_partial(&errs[i])) {
+            partials++;
+        }
+    }
+    (void)fprintf(f, "# codebase-memory-mcp index coverage report\n");
+    (void)fprintf(f, "# project=%s skipped=%d parse_partial=%d\n", project ? project : "",
+                  count - partials, partials);
     (void)fprintf(f, "# columns: phase\treason\tpath\n");
     for (int i = 0; i < count; i++) {
         (void)fprintf(f, "%s\t%s\t%s\n", errs[i].phase ? errs[i].phase : "",
@@ -3384,6 +3462,7 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                          const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
+    add_parse_partial_summary(doc, root, file_errors, file_error_count);
 
     int exp_nodes = -1;
     int exp_edges = -1;

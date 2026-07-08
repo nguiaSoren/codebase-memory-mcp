@@ -688,6 +688,61 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             const char *rel_path, int64_t timeout_micros,
                                             const char **extra_defines, const char **include_paths);
 
+/* Best-effort parse-coverage collection (#963). Walks only the has_error paths
+ * of the tree and records the 1-based line ranges of the TOP-MOST ERROR/MISSING
+ * nodes (does not descend into an error subtree — one range per failed region).
+ * Bounded by CBM_MAX_ERROR_REGIONS so pathological input can't blow up the
+ * output. The ranges mark where constructs were dropped; they are a detection
+ * aid, never a completeness proof. */
+#define CBM_MAX_ERROR_REGIONS 64
+typedef struct {
+    uint32_t starts[CBM_MAX_ERROR_REGIONS];
+    uint32_t ends[CBM_MAX_ERROR_REGIONS];
+    int count;
+} cbm_error_regions_t;
+
+static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
+    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
+        return;
+    }
+    acc->starts[acc->count] = ts_node_start_point(n).row + 1;
+    acc->ends[acc->count] = ts_node_end_point(n).row + 1;
+    acc->count++;
+}
+
+static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc) {
+    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
+        return;
+    }
+    uint32_t k = ts_node_child_count(n);
+    for (uint32_t i = 0; i < k && acc->count < CBM_MAX_ERROR_REGIONS; i++) {
+        TSNode c = ts_node_child(n, i);
+        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
+            cbm_error_regions_push(acc, c); /* top-most region; do not descend */
+        } else if (ts_node_has_error(c)) {
+            cbm_collect_error_regions(c, acc);
+        }
+    }
+}
+
+/* Serialize collected regions as "start-end,start-end,..." into the arena. */
+static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *regs) {
+    if (regs->count <= 0) {
+        return NULL;
+    }
+    enum { RANGE_MAX = 24 }; /* "4294967295-4294967295," */
+    char *buf = (char *)cbm_arena_alloc(a, (size_t)regs->count * RANGE_MAX);
+    if (!buf) {
+        return NULL;
+    }
+    size_t off = 0;
+    for (int i = 0; i < regs->count; i++) {
+        off += (size_t)snprintf(buf + off, RANGE_MAX, "%s%u-%u", i ? "," : "", regs->starts[i],
+                                regs->ends[i]);
+    }
+    return buf;
+}
+
 /* Public entry: run the extraction and journal completion. The DONE mark on
  * every ordinary return (including error/timeout results) tells the crash
  * supervisor this file did NOT kill the worker — only a file whose S has no
@@ -787,6 +842,22 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     }
 
     TSNode root = ts_tree_root_node(tree);
+
+    /* Best-effort parse-coverage signal (#963): flag files whose tree contains
+     * ERROR/MISSING nodes — constructs inside those regions are silently absent
+     * from the graph. Detection aid only: the absence of this flag is NOT a
+     * completeness guarantee. */
+    if (ts_node_has_error(root)) {
+        result->parse_incomplete = true;
+        cbm_error_regions_t regs = {{0}, {0}, 0};
+        if (strcmp(ts_node_type(root), "ERROR") == 0) {
+            cbm_error_regions_push(&regs, root); /* whole file unparseable */
+        } else {
+            cbm_collect_error_regions(root, &regs);
+        }
+        result->error_region_count = regs.count;
+        result->error_ranges = cbm_error_ranges_str(a, &regs);
+    }
 
     // Compute module QN. Java/Go derive the module from the CONTAINING
     // DIRECTORY (package semantics) rather than baking the filename stem in,

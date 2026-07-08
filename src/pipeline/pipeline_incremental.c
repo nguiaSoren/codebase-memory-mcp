@@ -840,6 +840,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
 
     run_extract_resolve(&ctx, changed_files, ci);
+    /* Stamp parse-partial File nodes (#963) for the changed slice. A changed
+     * file that parses cleanly now got fresh "{}" props above, so a stale
+     * marker from a previous run cannot survive the reindex. */
+    cbm_pipeline_stamp_parse_partial(p, existing);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
     run_postpasses(&ctx, changed_files, ci, project);
 

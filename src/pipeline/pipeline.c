@@ -315,6 +315,40 @@ void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **ou
     }
 }
 
+void cbm_pipeline_stamp_parse_partial(cbm_pipeline_t *p, cbm_gbuf_t *gbuf) {
+    if (!p || !gbuf) {
+        return;
+    }
+    int stamped = 0;
+    for (int i = 0; i < p->file_errors_count; i++) {
+        const cbm_file_error_t *e = &p->file_errors[i];
+        if (!e->path || !e->phase || strcmp(e->phase, "parse_partial") != 0) {
+            continue;
+        }
+        char *file_qn = cbm_pipeline_fqn_compute(p->project_name, e->path, "__file__");
+        if (!file_qn) {
+            continue;
+        }
+        const char *slash = strrchr(e->path, '/');
+        const char *basename = slash ? slash + SKIP_ONE : e->path;
+        const char *ext = strrchr(basename, '.');
+        /* Full replacement props (set_node_props does not merge): keep the
+         * "extension" key pass_structure wrote, add the coverage marker. The
+         * ranges string is digits/commas/dashes — JSON-safe unescaped. */
+        char props[CBM_SZ_2K];
+        snprintf(props, sizeof(props),
+                 "{\"extension\":\"%s\",\"parse_incomplete\":true,\"error_ranges\":\"%s\"}",
+                 ext ? ext : "", e->reason ? e->reason : "");
+        if (cbm_gbuf_set_node_props(gbuf, file_qn, props)) {
+            stamped++;
+        }
+        free(file_qn);
+    }
+    if (stamped > 0) {
+        cbm_log_info("index.parse_partial", "files", itoa_buf(stamped));
+    }
+}
+
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges) {
     if (nodes) {
         *nodes = p ? p->committed_nodes : -1;
@@ -1261,6 +1295,11 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
+    }
+    if (rc == 0) {
+        /* Extraction merged its per-file errors — stamp parse-partial File
+         * nodes (#963) before downstream passes and the dump. */
+        cbm_pipeline_stamp_parse_partial(p, p->gbuf);
     }
     return rc;
 }
