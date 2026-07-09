@@ -162,16 +162,51 @@ static TSNode perl_decl_target(TSNode node) {
     return node;
 }
 
+/* Collect `node`'s children into a malloc'd array so callers get O(1) indexed
+ * access on WIDE nodes: bare ts_node_child(node, i) is O(i), so an index loop
+ * over a wide flat node is O(n^2) — the class of bug the ARM
+ * `extract_wide_flat_file_is_linear` guard caught. Returns NULL for small nodes
+ * (< PERL_CURSOR_MIN_CHILDREN) and on OOM; callers then fall back to
+ * ts_node_child, which is cheaper at small child counts and merely
+ * quadratic-but-correct on OOM. Mirrors wd_collect_children in extract_defs.c.
+ * Caller frees. */
+enum { PERL_CURSOR_MIN_CHILDREN = 64 };
+static TSNode *perl_collect_children(TSNode node, uint32_t cc) {
+    if (cc < PERL_CURSOR_MIN_CHILDREN)
+        return NULL;
+    TSNode *buf = (TSNode *)malloc((size_t)cc * sizeof(TSNode));
+    if (!buf)
+        return NULL;
+    TSTreeCursor cur = ts_tree_cursor_new(node);
+    uint32_t got = 0;
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            buf[got++] = ts_tree_cursor_current_node(&cur);
+        } while (got < cc && ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    if (got != cc) {
+        /* Defensive: cursor and child_count disagree — fall back to indexed. */
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
 /* Find the first named child whose node type is `kind` (shallow). */
 static TSNode perl_first_child_of_type(TSNode node, const char *kind) {
     uint32_t nc = ts_node_child_count(node);
+    TSNode *kids = perl_collect_children(node, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(node, i);
+        TSNode c = kids ? kids[i] : ts_node_child(node, i);
         if (ts_node_is_null(c) || !ts_node_is_named(c))
             continue;
-        if (strcmp(ts_node_type(c), kind) == 0)
+        if (strcmp(ts_node_type(c), kind) == 0) {
+            free(kids);
             return c;
+        }
     }
+    free(kids);
     TSNode null_node;
     memset(&null_node, 0, sizeof(null_node));
     return null_node;
@@ -372,8 +407,9 @@ static const CBMType *perl_eval_bless(PerlLSPContext *ctx, TSNode call_node) {
     memset(&class_arg, 0, sizeof(class_arg));
     bool have_class = false;
     uint32_t nc = ts_node_child_count(args);
+    TSNode *kids = perl_collect_children(args, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(args, i);
+        TSNode c = kids ? kids[i] : ts_node_child(args, i);
         if (ts_node_is_null(c) || !ts_node_is_named(c))
             continue;
         const char *ck = ts_node_type(c);
@@ -387,6 +423,7 @@ static const CBMType *perl_eval_bless(PerlLSPContext *ctx, TSNode call_node) {
             break;
         }
     }
+    free(kids);
 
     const char *pkg =
         ctx->enclosing_package_qn ? ctx->enclosing_package_qn : ctx->current_package_qn;
@@ -464,13 +501,15 @@ const CBMType *perl_eval_expr_type(PerlLSPContext *ctx, TSNode node) {
     } else if (strcmp(k, "parenthesized_expression") == 0 || strcmp(k, "list_expression") == 0) {
         /* Unwrap a single meaningful child. */
         uint32_t nc = ts_node_child_count(node);
+        TSNode *kids = perl_collect_children(node, nc);
         for (uint32_t i = 0; i < nc; i++) {
-            TSNode c = ts_node_child(node, i);
+            TSNode c = kids ? kids[i] : ts_node_child(node, i);
             if (ts_node_is_null(c) || !ts_node_is_named(c))
                 continue;
             result = perl_eval_expr_type(ctx, c);
             break;
         }
+        free(kids);
     }
     /* Hash/array deref of an unknown type → unknown (no edge). Anything we did
      * not recognize stays unknown. */
@@ -794,11 +833,13 @@ static void perl_resolve_calls_in_node_inner(PerlLSPContext *ctx, TSNode node) {
 
     /* Recurse. */
     uint32_t nc = ts_node_child_count(node);
+    TSNode *kids = perl_collect_children(node, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(node, i);
+        TSNode c = kids ? kids[i] : ts_node_child(node, i);
         if (!ts_node_is_null(c))
             perl_resolve_calls_in_node(ctx, c);
     }
+    free(kids);
 }
 
 /* ── subroutine processing ──────────────────────────────────────── */
@@ -839,8 +880,9 @@ static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
     if (!pkg || !pkg[0])
         return;
     uint32_t nc = ts_node_child_count(body);
+    TSNode *kids = perl_collect_children(body, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode stmt = ts_node_child(body, i);
+        TSNode stmt = kids ? kids[i] : ts_node_child(body, i);
         if (ts_node_is_null(stmt) || !ts_node_is_named(stmt))
             continue;
 
@@ -884,8 +926,10 @@ static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
         const char *bare = perl_strip_sigil(vtxt);
         if (bare && bare[0])
             cbm_scope_bind(ctx->current_scope, bare, cbm_type_named(ctx->arena, pkg));
+        free(kids);
         return; /* only the first invocant binding */
     }
+    free(kids);
 }
 
 static void process_subroutine(PerlLSPContext *ctx, TSNode node) {
@@ -953,8 +997,9 @@ static void perl_collect_qw_imports(PerlLSPContext *ctx, TSNode container,
     if (ts_node_is_null(qw))
         return;
     uint32_t nc = ts_node_child_count(qw);
+    TSNode *kids = perl_collect_children(qw, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode w = ts_node_child(qw, i);
+        TSNode w = kids ? kids[i] : ts_node_child(qw, i);
         if (ts_node_is_null(w) || !ts_node_is_named(w))
             continue;
         char *word = perl_node_text(ctx, w);
@@ -972,6 +1017,7 @@ static void perl_collect_qw_imports(PerlLSPContext *ctx, TSNode container,
         char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", module_dot, fn);
         perl_lsp_add_use(ctx, fn, target);
     }
+    free(kids);
 }
 
 /* Recursively collect parent package names from a subtree, registering each
@@ -1001,8 +1047,9 @@ static void perl_collect_parents(PerlLSPContext *ctx, TSNode node, const char *c
     /* quoted_word_list words come through as named string-content children. */
     if (strcmp(k, "quoted_word_list") == 0) {
         uint32_t nc = ts_node_child_count(node);
+        TSNode *kids = perl_collect_children(node, nc);
         for (uint32_t i = 0; i < nc; i++) {
-            TSNode w = ts_node_child(node, i);
+            TSNode w = kids ? kids[i] : ts_node_child(node, i);
             if (ts_node_is_null(w) || !ts_node_is_named(w))
                 continue;
             char *pw = perl_node_text(ctx, w);
@@ -1011,15 +1058,18 @@ static void perl_collect_parents(PerlLSPContext *ctx, TSNode node, const char *c
             if (pw && pw[0])
                 perl_add_isa(ctx, child_pkg, pw);
         }
+        free(kids);
         return;
     }
     /* list_expression / parenthesized: descend. */
     uint32_t nc = ts_node_child_count(node);
+    TSNode *kids = perl_collect_children(node, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(node, i);
+        TSNode c = kids ? kids[i] : ts_node_child(node, i);
         if (!ts_node_is_null(c) && ts_node_is_named(c))
             perl_collect_parents(ctx, c, child_pkg, depth + 1);
     }
+    free(kids);
 }
 
 /* Process a `use_statement`:
@@ -1046,8 +1096,9 @@ static void perl_collect_use_statement(PerlLSPContext *ctx, TSNode node) {
          * `quoted_word_list` (use parent qw(Base)). Scan every named child
          * except the leading `module` bareword (parent/base). */
         uint32_t nc = ts_node_child_count(node);
+        TSNode *kids = perl_collect_children(node, nc);
         for (uint32_t i = 0; i < nc; i++) {
-            TSNode c = ts_node_child(node, i);
+            TSNode c = kids ? kids[i] : ts_node_child(node, i);
             if (ts_node_is_null(c) || !ts_node_is_named(c))
                 continue;
             /* Skip the module bareword itself (it equals "parent"/"base"). */
@@ -1055,6 +1106,7 @@ static void perl_collect_use_statement(PerlLSPContext *ctx, TSNode node) {
                 continue;
             perl_collect_parents(ctx, c, child_pkg, 0);
         }
+        free(kids);
         return;
     }
 
@@ -1098,8 +1150,9 @@ static void perl_collect_isa_assignment(PerlLSPContext *ctx, TSNode assign) {
      * scanning the RHS children is safe. */
     bool seen_eq = false;
     uint32_t nc = ts_node_child_count(assign);
+    TSNode *kids = perl_collect_children(assign, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(assign, i);
+        TSNode c = kids ? kids[i] : ts_node_child(assign, i);
         if (ts_node_is_null(c))
             continue;
         if (!ts_node_is_named(c)) {
@@ -1112,6 +1165,7 @@ static void perl_collect_isa_assignment(PerlLSPContext *ctx, TSNode assign) {
             continue;
         perl_collect_parents(ctx, c, child_pkg, 0);
     }
+    free(kids);
 }
 
 /* Recursively scan (PASS 1) for package context, @ISA assignments, and `use`
@@ -1139,11 +1193,13 @@ static void perl_pass1_scan_inner(PerlLSPContext *ctx, TSNode node) {
         perl_collect_isa_assignment(ctx, node);
     }
     uint32_t nc = ts_node_child_count(node);
+    TSNode *kids = perl_collect_children(node, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(node, i);
+        TSNode c = kids ? kids[i] : ts_node_child(node, i);
         if (!ts_node_is_null(c))
             perl_pass1_scan(ctx, c);
     }
+    free(kids);
 }
 
 /* ── process_file: two-pass walk ────────────────────────────────── */
@@ -1165,8 +1221,9 @@ void perl_lsp_process_file(PerlLSPContext *ctx, TSNode root) {
     ctx->current_package_qn = "";
     ctx->enclosing_package_qn = "";
     uint32_t nc = ts_node_child_count(root);
+    TSNode *kids = perl_collect_children(root, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(root, i);
+        TSNode c = kids ? kids[i] : ts_node_child(root, i);
         if (ts_node_is_null(c))
             continue;
         const char *k = ts_node_type(c);
@@ -1174,11 +1231,13 @@ void perl_lsp_process_file(PerlLSPContext *ctx, TSNode root) {
             process_package_decl(ctx, c);
             /* Walk the (possibly block-scoped) package body for nested subs. */
             uint32_t bn = ts_node_child_count(c);
+            TSNode *bkids = perl_collect_children(c, bn);
             for (uint32_t bi = 0; bi < bn; bi++) {
-                TSNode bc = ts_node_child(c, bi);
+                TSNode bc = bkids ? bkids[bi] : ts_node_child(c, bi);
                 if (!ts_node_is_null(bc) && ts_node_is_named(bc))
                     perl_resolve_calls_in_node(ctx, bc);
             }
+            free(bkids);
         } else if (strcmp(k, "subroutine_declaration_statement") == 0 ||
                    strcmp(k, "method_declaration_statement") == 0) {
             process_subroutine(ctx, c);
@@ -1188,6 +1247,7 @@ void perl_lsp_process_file(PerlLSPContext *ctx, TSNode root) {
             perl_resolve_calls_in_node(ctx, c);
         }
     }
+    free(kids);
 }
 
 /* ── registry: per-package types + method tables ────────────────── */
@@ -1235,52 +1295,123 @@ static void perl_register_packages(PerlLSPContext *ctx, CBMTypeRegistry *reg) {
     }
 }
 
-/* Append a (short_name → sub_qn) entry to the package type's method tables,
- * creating the type if needed. */
-static void perl_type_add_method(PerlLSPContext *ctx, CBMTypeRegistry *reg, const char *pkg,
-                                 const char *short_name, const char *sub_qn) {
-    if (!cbm_registry_lookup_type(reg, pkg)) {
-        CBMRegisteredType rt;
-        memset(&rt, 0, sizeof(rt));
-        rt.qualified_name = cbm_arena_strdup(ctx->arena, pkg);
-        rt.short_name = rt.qualified_name;
-        cbm_registry_add_type(reg, rt);
-    }
-    for (int t = 0; t < reg->type_count; t++) {
-        CBMRegisteredType *rt = &reg->types[t];
-        if (!rt->qualified_name || strcmp(rt->qualified_name, pkg) != 0)
-            continue;
-        int cnt = 0;
-        if (rt->method_names)
-            while (rt->method_names[cnt])
-                cnt++;
-        const char **mn =
-            (const char **)cbm_arena_alloc(ctx->arena, (size_t)(cnt + 2) * sizeof(char *));
-        const char **mq =
-            (const char **)cbm_arena_alloc(ctx->arena, (size_t)(cnt + 2) * sizeof(char *));
-        if (!mn || !mq)
-            return;
-        for (int j = 0; j < cnt; j++) {
-            mn[j] = rt->method_names[j];
-            mq[j] = rt->method_qns[j];
-        }
-        mn[cnt] = cbm_arena_strdup(ctx->arena, short_name);
-        mq[cnt] = sub_qn;
-        mn[cnt + 1] = NULL;
-        mq[cnt + 1] = NULL;
-        rt->method_names = mn;
-        rt->method_qns = mq;
+/* One collected (package, short-name, sub-QN) mapping for the batch method-table
+ * build. All three strings are arena-owned (they outlive the transient vector),
+ * so the vector itself is a plain malloc'd scratch buffer freed in
+ * perl_attach_methods. `order` is the source-encounter index — a stable
+ * tiebreak so sorting by package preserves source order within a package
+ * (first-defined wins on a same-name redefinition, matching the old
+ * append-in-order behavior). */
+typedef struct {
+    const char *pkg;
+    const char *short_name;
+    const char *sub_qn;
+    int order;
+} PerlMethodEnt;
+
+typedef struct {
+    PerlMethodEnt *v;
+    int cnt;
+    int cap;
+    bool oom;
+} PerlMethodVec;
+
+/* Append a mapping. Geometric growth → O(1) amortized (the old per-sub
+ * perl_type_add_method rebuilt each package's whole method array on every add,
+ * which is O(methods^2) on a wide flat single-package file). On OOM the vector
+ * latches `oom` and drops further mappings: their method calls simply stay
+ * unresolved (graceful degradation, never a wrong edge). */
+static void perl_mvec_push(PerlMethodVec *mv, const char *pkg, const char *short_name,
+                           const char *sub_qn) {
+    if (mv->oom)
         return;
+    if (mv->cnt == mv->cap) {
+        int ncap = mv->cap ? mv->cap * 2 : 32;
+        PerlMethodEnt *nv = (PerlMethodEnt *)realloc(mv->v, (size_t)ncap * sizeof(PerlMethodEnt));
+        if (!nv) {
+            mv->oom = true;
+            return;
+        }
+        mv->v = nv;
+        mv->cap = ncap;
     }
+    PerlMethodEnt *e = &mv->v[mv->cnt];
+    e->pkg = pkg;
+    e->short_name = short_name;
+    e->sub_qn = sub_qn;
+    e->order = mv->cnt;
+    mv->cnt++;
+}
+
+/* Sort key: package name, then source order within a package. */
+static int perl_method_ent_cmp(const void *a, const void *b) {
+    const PerlMethodEnt *ea = (const PerlMethodEnt *)a;
+    const PerlMethodEnt *eb = (const PerlMethodEnt *)b;
+    int c = strcmp(ea->pkg, eb->pkg);
+    if (c != 0)
+        return c;
+    return ea->order - eb->order;
+}
+
+/* Build (or extend) a package type's method tables from a contiguous run of
+ * `n` same-package mappings — one allocation for the run, not one per method.
+ * Creating/finding the type is O(type_count) but happens once per DISTINCT
+ * package, not once per sub. */
+static void perl_type_set_methods(PerlLSPContext *ctx, CBMTypeRegistry *reg, const char *pkg,
+                                  const PerlMethodEnt *ents, int n) {
+    CBMRegisteredType *rt = NULL;
+    for (int t = 0; t < reg->type_count; t++) {
+        if (reg->types[t].qualified_name && strcmp(reg->types[t].qualified_name, pkg) == 0) {
+            rt = &reg->types[t];
+            break;
+        }
+    }
+    if (!rt) {
+        CBMRegisteredType nt;
+        memset(&nt, 0, sizeof(nt));
+        nt.qualified_name = cbm_arena_strdup(ctx->arena, pkg);
+        nt.short_name = nt.qualified_name;
+        cbm_registry_add_type(reg, nt);
+        if (reg->type_count == 0)
+            return; /* add failed (OOM) */
+        rt = &reg->types[reg->type_count - 1];
+    }
+
+    int existing = 0;
+    if (rt->method_names)
+        while (rt->method_names[existing])
+            existing++;
+    int total = existing + n;
+    const char **mn =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)(total + 1) * sizeof(char *));
+    const char **mq =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)(total + 1) * sizeof(char *));
+    if (!mn || !mq)
+        return;
+    for (int j = 0; j < existing; j++) {
+        mn[j] = rt->method_names[j];
+        mq[j] = rt->method_qns[j];
+    }
+    for (int j = 0; j < n; j++) {
+        mn[existing + j] = ents[j].short_name;
+        mq[existing + j] = ents[j].sub_qn;
+    }
+    mn[total] = NULL;
+    mq[total] = NULL;
+    rt->method_names = mn;
+    rt->method_qns = mq;
 }
 
 /* Walk the top level mapping each sub to its enclosing package, registering the
  * sub's QN in that package's method table so method dispatch finds it. */
 static void perl_attach_methods(PerlLSPContext *ctx, CBMTypeRegistry *reg, TSNode root) {
     const char *cur_pkg = "main";
+    PerlMethodVec mv;
+    memset(&mv, 0, sizeof(mv));
     uint32_t nc = ts_node_child_count(root);
+    TSNode *kids = perl_collect_children(root, nc);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(root, i);
+        TSNode c = kids ? kids[i] : ts_node_child(root, i);
         if (ts_node_is_null(c))
             continue;
         const char *k = ts_node_type(c);
@@ -1295,8 +1426,9 @@ static void perl_attach_methods(PerlLSPContext *ctx, CBMTypeRegistry *reg, TSNod
             }
             /* Block-scoped package body: subs are nested children. */
             uint32_t bn = ts_node_child_count(c);
+            TSNode *bkids = perl_collect_children(c, bn);
             for (uint32_t bi = 0; bi < bn; bi++) {
-                TSNode bc = ts_node_child(c, bi);
+                TSNode bc = bkids ? bkids[bi] : ts_node_child(c, bi);
                 if (ts_node_is_null(bc) || !ts_node_is_named(bc))
                     continue;
                 if (strcmp(ts_node_type(bc), "subroutine_declaration_statement") != 0 &&
@@ -1311,8 +1443,9 @@ static void perl_attach_methods(PerlLSPContext *ctx, CBMTypeRegistry *reg, TSNod
                 const char *bqn = ctx->module_qn
                                       ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, bsn)
                                       : cbm_arena_strdup(ctx->arena, bsn);
-                perl_type_add_method(ctx, reg, cur_pkg, bsn, bqn);
+                perl_mvec_push(&mv, cur_pkg, bsn, bqn);
             }
+            free(bkids);
             continue;
         }
         if (strcmp(k, "subroutine_declaration_statement") != 0 &&
@@ -1328,8 +1461,25 @@ static void perl_attach_methods(PerlLSPContext *ctx, CBMTypeRegistry *reg, TSNod
         const char *sub_qn = ctx->module_qn
                                  ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, sname)
                                  : cbm_arena_strdup(ctx->arena, sname);
-        perl_type_add_method(ctx, reg, cur_pkg, sname, sub_qn);
+        perl_mvec_push(&mv, cur_pkg, sname, sub_qn);
     }
+    free(kids);
+
+    /* Build each package's method table once from the collected mappings:
+     * sort by package (source order preserved within a package), then set each
+     * contiguous same-package run in a single allocation. */
+    if (mv.cnt > 0 && mv.v) {
+        qsort(mv.v, (size_t)mv.cnt, sizeof(PerlMethodEnt), perl_method_ent_cmp);
+        int s = 0;
+        while (s < mv.cnt) {
+            int e = s + 1;
+            while (e < mv.cnt && strcmp(mv.v[e].pkg, mv.v[s].pkg) == 0)
+                e++;
+            perl_type_set_methods(ctx, reg, mv.v[s].pkg, &mv.v[s], e - s);
+            s = e;
+        }
+    }
+    free(mv.v);
 }
 
 /* ── entry: cbm_run_perl_lsp ────────────────────────────────────── */
